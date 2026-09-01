@@ -26,6 +26,7 @@ on:
 env:
   FFTW_VERSION: 3.3.10
   LIGHTGBM_REF: v4.6.0
+  ORT_VERSION: 1.29.0
   NATIVE_DEPS_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.native_deps_mode || 'luna' }}
 
 jobs:
@@ -84,7 +85,8 @@ jobs:
           path: |
             ~/LightGBM
             ~/native-deps/windows-fftw
-          key: native-deps-${{ runner.os }}-${{ runner.arch }}-mingw-fftw-${{ env.FFTW_VERSION }}-lgbm-${{ env.LIGHTGBM_REF }}
+            ~/native-deps/windows-ort
+          key: native-deps-${{ runner.os }}-${{ runner.arch }}-mingw-fftw-${{ env.FFTW_VERSION }}-lgbm-${{ env.LIGHTGBM_REF }}-ort-${{ env.ORT_VERSION }}
       - name: Native deps cache status
         run: |
           echo "NATIVE_DEPS_MODE=${NATIVE_DEPS_MODE}"
@@ -98,6 +100,23 @@ jobs:
           cp /mingw64/include/fftw3.h ${HOME}/native-deps/windows-fftw/include/
           cp /mingw64/lib/libfftw3.dll.a ${HOME}/native-deps/windows-fftw/lib/libfftw3.a
           cp /mingw64/bin/libfftw3-3.dll ${HOME}/native-deps/windows-fftw/bin/
+      - name: Download ONNX Runtime
+        if: env.NATIVE_DEPS_MODE == 'all' || steps.cache-native.outputs.cache-hit != 'true'
+        run: |
+          # Official release ships headers flat under include/, but Luna's
+          # source includes them as <onnxruntime/core/session/...> (matching
+          # the layout of the full ONNX Runtime source tree). Re-nest them
+          # to match on staging rather than patching Luna's #include paths.
+          rm -rf ${HOME}/native-deps/windows-ort
+          mkdir -p ${HOME}/native-deps/windows-ort/include/onnxruntime/core/session
+          mkdir -p ${HOME}/native-deps/windows-ort/lib
+          cd ${HOME}
+          curl -L -o ort.zip https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-win-x64-${ORT_VERSION}.zip
+          unzip -q ort.zip -d ort-extracted
+          cp ort-extracted/onnxruntime-win-x64-${ORT_VERSION}/include/*.h ${HOME}/native-deps/windows-ort/include/onnxruntime/core/session/
+          cp ort-extracted/onnxruntime-win-x64-${ORT_VERSION}/lib/onnxruntime.dll ${HOME}/native-deps/windows-ort/lib/
+          cp ort-extracted/onnxruntime-win-x64-${ORT_VERSION}/lib/onnxruntime_providers_shared.dll ${HOME}/native-deps/windows-ort/lib/
+          rm -rf ort.zip ort-extracted
       - name: Build LightGBM
         if: env.NATIVE_DEPS_MODE == 'all' || steps.cache-native.outputs.cache-hit != 'true'
         run: |
@@ -111,11 +130,11 @@ jobs:
           mingw32-make.exe -j4
       - uses: actions/checkout@v4
       - run: |
-          mingw32-make.exe -j${NUMBER_OF_PROCESSORS:-4} ARCH=WINDOWS LGBM=1 LGBM_PATH=${HOME}/LightGBM FFTW=${HOME}/native-deps/windows-fftw
+          mingw32-make.exe -j${NUMBER_OF_PROCESSORS:-4} ARCH=WINDOWS LGBM=1 LGBM_PATH=${HOME}/LightGBM FFTW=${HOME}/native-deps/windows-fftw ORT=1 ORT_PATH=${HOME}/native-deps/windows-ort
           if [[ "${{ needs.release-meta.outputs.enabled }}" == "true" ]]; then
             v="${{ needs.release-meta.outputs.version }}"
             mkdir luna-${v}
-            cp *.exe ${HOME}/native-deps/windows-fftw/bin/libfftw3-3.dll ${HOME}/LightGBM/lib_lightgbm.dll /mingw64/bin/libgcc_s_seh-1.dll /mingw64/bin/libgomp-1.dll /mingw64/bin/libwinpthread-1.dll luna-${v}/
+            cp *.exe ${HOME}/native-deps/windows-fftw/bin/libfftw3-3.dll ${HOME}/LightGBM/lib_lightgbm.dll ${HOME}/native-deps/windows-ort/lib/onnxruntime.dll ${HOME}/native-deps/windows-ort/lib/onnxruntime_providers_shared.dll /mingw64/bin/libgcc_s_seh-1.dll /mingw64/bin/libgomp-1.dll /mingw64/bin/libwinpthread-1.dll luna-${v}/
             zip -r win-luna.zip luna-${v}
           fi
       - uses: actions/upload-artifact@v4
@@ -272,7 +291,8 @@ jobs:
           path: |
             ~/LightGBM
             ~/fftw-${{ env.FFTW_VERSION }}
-          key: native-deps-${{ runner.os }}-${{ runner.arch }}-fftw-${{ env.FFTW_VERSION }}-lgbm-${{ env.LIGHTGBM_REF }}
+            ~/native-deps/linux-ort
+          key: native-deps-${{ runner.os }}-${{ runner.arch }}-fftw-${{ env.FFTW_VERSION }}-lgbm-${{ env.LIGHTGBM_REF }}-ort-${{ env.ORT_VERSION }}
       - name: Native deps cache status
         run: |
           echo "NATIVE_DEPS_MODE=${NATIVE_DEPS_MODE}"
@@ -301,9 +321,33 @@ jobs:
           cmake -DCMAKE_BUILD_TYPE=Release ..
           make -j$(nproc)
           cd ${GITHUB_WORKSPACE}
+      - name: Build ONNX Runtime
+        if: env.NATIVE_DEPS_MODE == 'all' || steps.cache-native.outputs.cache-hit != 'true'
+        run: |
+          cd ${HOME}
+          rm -rf onnxruntime-src
+          git clone --branch v${ORT_VERSION} --depth 1 https://github.com/microsoft/onnxruntime onnxruntime-src
+          cd onnxruntime-src
+          python3 -m pip install --break-system-packages -r requirements.txt
+          python3 tools/ci_build/build.py \
+            --build_dir build/Linux \
+            --config Release \
+            --build_shared_lib \
+            --skip_tests \
+            --parallel 0 \
+            --disable_contrib_ops \
+            --disable_ml_ops \
+            --no_telemetry \
+            --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF \
+            --cmake_generator "Unix Makefiles" \
+            --update --build
+          rm -rf ${HOME}/native-deps/linux-ort
+          mkdir -p ${HOME}/native-deps/linux-ort/lib ${HOME}/native-deps/linux-ort/include
+          cp -P build/Linux/Release/libonnxruntime.so* ${HOME}/native-deps/linux-ort/lib/
+          cp -R include/onnxruntime ${HOME}/native-deps/linux-ort/include/
       - name: make
         run: |
-          make -j$(nproc) FFTW=${HOME}/fftw-${FFTW_VERSION} LGBM=1 LGBM_PATH=${HOME}/LightGBM
+          make -j$(nproc) FFTW=${HOME}/fftw-${FFTW_VERSION} LGBM=1 LGBM_PATH=${HOME}/LightGBM ORT=1 ORT_PATH=${HOME}/native-deps/linux-ort
   release:
     runs-on: ubuntu-latest
     needs: [release-meta, linux-build, macos-build, windows-build, macos-arm64-build]
