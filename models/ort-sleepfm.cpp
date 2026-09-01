@@ -33,6 +33,10 @@
 #include <onnxruntime/core/session/onnxruntime_cxx_api.h>
 #endif
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -65,6 +69,25 @@ static std::string join_path(const std::string &path, const std::string &root) {
   if (path.back() == '/' || path.back() == '\\') return path + root;
   return path + "/" + root;
 }
+
+#ifdef HAS_ORT
+// Ort::Session's path-taking constructor expects ORTCHAR_T, which is
+// wchar_t on Windows and plain char elsewhere -- a UTF-8 std::string can't
+// be passed directly on Windows, so convert with the Win32 API rather than
+// naively widening each byte (which would corrupt any non-ASCII path).
+#ifdef _WIN32
+static std::wstring to_ort_path(const std::string &utf8) {
+  if (utf8.empty()) return std::wstring();
+  const int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, nullptr, 0);
+  std::wstring wide(wlen, L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, &wide[0], wlen);
+  wide.resize(wlen - 1); // drop the null terminator MultiByteToWideChar counted
+  return wide;
+}
+#else
+static const std::string &to_ort_path(const std::string &utf8) { return utf8; }
+#endif
+#endif
 
 static std::vector<float> resample(const std::vector<double> &x, double from, double to, int n) {
   std::vector<float> y(n, 0);
@@ -161,7 +184,7 @@ void proc_ort(edf_t &edf, param_t &param) {
   Ort::SessionOptions opts;
   opts.SetIntraOpNumThreads(param.has("threads") ? param.requires_int("threads") : 1);
   opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_BASIC);
-  Ort::Session session(env, model.c_str(), opts);
+  Ort::Session session(env, to_ort_path(model).c_str(), opts);
   Ort::AllocatorWithDefaultOptions alloc;
 
   if (session.GetInputCount() < 2 || session.GetOutputCount() < 2)
