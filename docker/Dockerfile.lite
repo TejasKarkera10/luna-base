@@ -1,0 +1,51 @@
+FROM alpine:3.20.3 AS build
+
+LABEL description="Luna build container"
+
+WORKDIR /home
+
+# NOTE: ONNX Runtime is intentionally NOT built into this image. Alpine uses
+# musl, and the prebuilt ORT releases are glibc-only, so ORT support here
+# would require building ORT from source against musl - a build Microsoft
+# doesn't officially support and which needs real source patches to get
+# through (execinfo.h / backtrace differences, etc). Per team decision, we're
+# skipping ORT for luna.lite rather than sinking time into that; ORT support
+# lives in Dockerfile and Dockerfile.lunapi (glibc-based images) instead.
+
+RUN apk update \
+ && apk add --no-cache coreutils gcc g++ fftw-dev git make cmake \
+ && git clone --recursive https://github.com/microsoft/LightGBM \
+ && cd LightGBM \
+ && mkdir build \
+ && cd build \
+ && cmake .. \
+ && make -j2 \
+ && make install \
+ && cd /home
+
+# Keep the expensive native build cached by default.  Use
+# --build-arg LUNA_CACHE_BUST=... when deliberately rebuilding Luna.
+ARG LUNA_CACHE_BUST=0
+RUN echo "LUNA_CACHE_BUST=${LUNA_CACHE_BUST}"
+
+RUN git clone https://github.com/remnrem/luna-base.git \
+ && cd luna-base \
+ && make -j2 ARCH=LINUX LGBM=1 \
+ && cp luna destrat behead /usr/local/bin/ \
+ && cd .. \
+ && rm -rf luna-base \
+ && rm -rf LightGBM
+
+
+FROM alpine:3.20.3 AS runtime
+LABEL description="Luna runtime container"
+
+RUN apk update && apk add --no-cache \
+    libstdc++ fftw libgomp
+
+COPY --from=build /usr/local/bin/luna /usr/local/bin/luna
+COPY --from=build /usr/local/bin/destrat /usr/local/bin/destrat
+COPY --from=build /usr/local/bin/behead /usr/local/bin/behead
+COPY --from=build /usr/local/lib/lib_lightgbm.so /usr/local/lib/lib_lightgbm.so
+
+WORKDIR /data
